@@ -831,6 +831,12 @@ document.addEventListener('dblclick', e => { if (e.isTrusted && Date.now() - syn
 document.addEventListener('gesturestart', e => e.preventDefault());
 
 /* ---------- audio session + keep the screen on while the app is in use ---------- */
+try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+// iOS only starts audio from a tap (touchend / click): wake the audio engine on every tap if it is not running
+const unlock = () => { try { const A = window.__adj && window.__adj.A; const c = A && A.ctx; if (!c) return;
+  if (c.state !== 'running') c.resume().catch(() => {});
+  if (!unlock.done){ const b = c.createBuffer(1, 1, c.sampleRate), s = c.createBufferSource(); s.buffer = b; s.connect(c.destination); s.start(0); unlock.done = true; } } catch (e) {} };
+document.addEventListener('touchend', unlock, true); document.addEventListener('click', unlock, true);
 let wake = null;
 async function keepAwake(){ try { if (navigator.wakeLock && (!wake || wake.released) && document.visibilityState === 'visible') wake = await navigator.wakeLock.request('screen'); } catch (e) {} }
 document.addEventListener('pointerdown', () => {
@@ -1019,7 +1025,7 @@ function makeInsertPoint(c){ // shared shape for channels and master
   return p;
 }
 function ensureAudio(){
-  if (A.ctx) { if (A.ctx.state === 'suspended') A.ctx.resume().catch(() => {}); return A.ctx; }
+  if (A.ctx) { if (A.ctx.state !== 'running' && A.ctx.state !== 'closed') A.ctx.resume().catch(() => {}); return A.ctx; }
   try {
     const C = window.AudioContext || window.webkitAudioContext; if (!C) return null;
     const c = A.ctx = new C({ latencyHint: AUDIO_PREFS.latency || 'interactive' });
@@ -1203,9 +1209,25 @@ function renderFxStatus(){
   setText('fx-status', want ? `${want.type} ${want.beat} on ${want.ch === 'M' ? 'master' : 'channel ' + want.ch}${st.padFx ? ' (pad)' : ''}` : 'Off');
 }
 
+class BufPlayer {
+  constructor(c, buf, dest){ this.c = c; this.buf = buf; this.dest = dest; this.node = null; this.off = 0; this.t0 = 0; this.rate = 1; this.paused = true; this.seeking = false; this.preservesPitch = true; this.fns = []; }
+  get duration(){ return this.buf.duration; }
+  get currentTime(){ return this.paused ? this.off : Math.min(this.buf.duration, this.off + (this.c.currentTime - this.t0) * this.rate); }
+  set currentTime(v){ const was = !this.paused; if (was) this._stop(); this.off = Math.max(0, Math.min(this.buf.duration, +v || 0)); if (was) this._start(); }
+  get playbackRate(){ return this.rate; }
+  set playbackRate(r){ r = +r || 1; if (!this.paused){ this.off = this.currentTime; this.t0 = this.c.currentTime; if (this.node) this.node.playbackRate.setValueAtTime(r, this.c.currentTime); } this.rate = r; }
+  _start(){ const n = this.c.createBufferSource(); n.buffer = this.buf; n.playbackRate.value = this.rate; n.connect(this.dest);
+    n.onended = () => { if (this.node === n && !this.paused && this.currentTime >= this.buf.duration - 0.05){ this.paused = true; this.off = this.buf.duration; this.node = null; this.fns.forEach(f => f()); } };
+    this.t0 = this.c.currentTime; n.start(0, Math.min(this.off, Math.max(0, this.buf.duration - 0.001))); this.node = n; this.paused = false; }
+  _stop(){ const n = this.node; this.off = this.currentTime; this.node = null; this.paused = true; if (n){ try { n.onended = null; n.stop(); n.disconnect(); } catch (e) {} } }
+  play(){ if (this.c.state !== 'running') this.c.resume().catch(() => {}); if (this.paused) this._start(); return Promise.resolve(); }
+  pause(){ if (!this.paused) this._stop(); }
+  addEventListener(type, fn){ if (type === 'ended') this.fns.push(fn); }
+}
 function attachAudio(d){
   if (d.audio){ try { d.audio.pause(); } catch(e){} d.audio = null; d.src && d.src.disconnect(); d.src = null; }
   if (!d.track || !d.track.real || !d.track.url) return;
+  if (IPAD && d.track._ab){ const c = ensureAudio(); if (c){ const p = new BufPlayer(c, d.track._ab, A.ch[d.n].trim); p.addEventListener('ended', () => { d.playing = false; renderDeckState(d); }); d.audio = p; return; } }
   const c = ensureAudio(); const el = new Audio(); el.src = d.track.url; el.preload = 'auto'; el.preservesPitch = d.mt;
   el.addEventListener('ended', () => { d.playing = false; renderDeckState(d); });
   if (c){ try { d.src = c.createMediaElementSource(el); d.src.connect(A.ch[d.n].trim); } catch(e){} }
@@ -2334,7 +2356,7 @@ async function analyseTrack(t, full){
   if (full) logLine('deck waveform ready: ' + t.path + ' in ' + Math.round(performance.now() - t0) + ' ms, frames ' + (r.wave && r.wave.n));
   t.dur = ab.duration; t.bpmAuto = r.bpm; t.fbAuto = r.fb; if (!t.gridEdited){ t.bpm = r.bpm; t.fb = r.fb; } if (!t.keyTag && r.key) t.key = r.key; t.ov = bytesToB64(r.ov); t._ov = null; t.analyzed = true; t.error = null;
   ovCache.delete(t.id);
-  if (full){ waveCache.set(t.id, r.wave); if (!t.url) t.url = URL.createObjectURL(new Blob([bytes], { type: MIME[t.type] || 'audio/wav' })); trimWaves(); }
+  if (full){ if (IPAD) t._ab = ab; waveCache.set(t.id, r.wave); if (!t.url) t.url = URL.createObjectURL(new Blob([bytes], { type: MIME[t.type] || 'audio/wav' })); trimWaves(); }
   return r;
 }
 const fullJobs = new Map();
@@ -2348,7 +2370,7 @@ function releaseIfUnused(t){ if (!t || !t.real || onDecks(t)) return; trimWaves(
 function trimWaves(){ // keep full waveforms + audio for what is on the decks plus a few recent tracks
   const real = [...waveCache.keys()].filter(id => { const t = byId(id); return t && t.real && BR; });
   let extra = real.length - 4;
-  for (const id of real){ if (extra <= 0) break; const t = byId(id); if (onDecks(t)) continue; waveCache.delete(id); ovCache.delete(id); if (t.url){ URL.revokeObjectURL(t.url); t.url = null; } extra--; }
+  for (const id of real){ if (extra <= 0) break; const t = byId(id); if (onDecks(t)) continue; waveCache.delete(id); ovCache.delete(id); if (t.url){ URL.revokeObjectURL(t.url); t.url = null; } t._ab = null; extra--; }
 }
 // background queue: analyses everything that hasn't been analysed yet, gently while decks are playing
 const queue = []; let qRunning = false;
